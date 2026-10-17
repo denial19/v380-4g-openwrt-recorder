@@ -109,3 +109,18 @@ This repository does **not** vendor either upstream project's source code or use
 ## License
 
 MIT license for the original repository code. No license is granted for the device manufacturer's proprietary software, firmware, or protocols.
+
+
+## Release v1.0.0: documentation and verification
+
+- [Release notes](RELEASE_NOTES.md) and [changelog](CHANGELOG.md)
+- [V380 relay protocol field notes](docs/PROTOCOL.md)
+- [Camera and firmware compatibility](docs/COMPATIBILITY.md)
+- [Clean-install and smoke-test checklist](docs/CLEAN_INSTALL.md)
+- [Troubleshooting and sanitized log examples](docs/TROUBLESHOOTING.md)
+- [Credits](CREDITS.md)
+- [CI tests](tests/) and [local secret/history audit](scripts/security_audit.py)
+
+Before tagging a release, run `sh scripts/release-check.sh`. Field validation has
+been performed on one camera only; the clean-install test is a source-copy/
+compilation dry-run, not an unattended install on a second physical router.
