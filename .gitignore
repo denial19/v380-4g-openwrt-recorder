@@ -1,0 +1,25 @@
+# Never publish recordings, logs or local configuration/credentials.
+__pycache__/
+*.py[cod]
+*.log
+*.log.*
+*.bin
+*.h265
+*.mp4
+*.alaw
+*.aac
+*.tar.gz
+archive/
+recordings/
+work/
+*.bak
+*.bak.*
+*password*
+.env
+config.json
+config.local.json
+*.pem
+id_rsa
+id_ed25519
+.ssh/
+.DS_Store

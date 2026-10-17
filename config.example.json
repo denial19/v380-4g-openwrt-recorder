@@ -1,0 +1,7 @@
+{
+  "device_id": 12345678,
+  "relay_allowlist": ["203.0.113.10"],
+  "fps": 12,
+  "max_archive_gib": 20,
+  "min_free_gib": 3
+}
