@@ -1,0 +1,109 @@
+name: Build standalone HEVC frame extractor (ARM64 musl)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-hevc-arm64.yml'
+      - 'scripts/extract-hevc-frame.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  static-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential musl-tools pkg-config xz-utils ca-certificates curl file ffmpeg
+
+      - name: Compile minimal static FFmpeg (ARMv8 Cortex-A53 compatible)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = 'aarch64'
+          mkdir -p "$RUNNER_TEMP/ffmpeg-build" "$RUNNER_TEMP/bundle"
+          cd "$RUNNER_TEMP/ffmpeg-build"
+
+          # Pinned to the upstream FFmpeg 6.1.5 source release.
+          curl --fail --location --retry 3 --silent --show-error \
+            https://ffmpeg.org/releases/ffmpeg-6.1.5.tar.xz \
+            -o ffmpeg-6.1.5.tar.xz
+          echo '05fbe9db1f5452a3605bb1d9bf91da9d4bb08162891692e4f172b58c49109412  ffmpeg-6.1.5.tar.xz' | sha256sum -c -
+          tar -xf ffmpeg-6.1.5.tar.xz
+          cd ffmpeg-6.1.5
+
+          ./configure \
+            --cc=musl-gcc --ld=musl-gcc \
+            --arch=aarch64 --cpu=cortex-a53 --target-os=linux \
+            --extra-cflags='-O2 -mcpu=cortex-a53' \
+            --extra-ldflags='-static' \
+            --disable-autodetect \
+            --enable-static --disable-shared \
+            --disable-doc --disable-debug --enable-small \
+            --disable-network --disable-avdevice --disable-postproc \
+            --disable-programs --enable-ffmpeg \
+            --disable-everything \
+            --enable-protocol=file \
+            --enable-demuxer=mov --enable-demuxer=hevc \
+            --enable-parser=hevc --enable-decoder=hevc \
+            --enable-encoder=mjpeg --enable-muxer=image2 \
+            --enable-filter=scale --enable-filter=format \
+            --enable-swscale \
+            --disable-ffplay --disable-ffprobe
+
+          make -j 4 ffmpeg
+          strip ffmpeg
+          cp ffmpeg "$RUNNER_TEMP/bundle/ffmpeg-hevc"
+          cp COPYING.LGPLv2.1 LICENSE.md "$RUNNER_TEMP/bundle/"
+          chmod 755 "$RUNNER_TEMP/bundle/ffmpeg-hevc"
+
+          file "$RUNNER_TEMP/bundle/ffmpeg-hevc"
+          if readelf -l "$RUNNER_TEMP/bundle/ffmpeg-hevc" | grep -q INTERP; then
+            echo 'ERROR: output is dynamically linked' >&2
+            exit 1
+          fi
+
+      - name: Verify HEVC decode and JPEG output on ARM64 runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/bundle/ffmpeg-hevc"
+          "$BIN" -hide_banner -decoders | grep -E ' hevc +'
+          "$BIN" -hide_banner -demuxers | grep -E ' mov,'
+          "$BIN" -hide_banner -encoders | grep -E ' mjpeg +'
+
+          # A synthetic test clip; no camera credentials or footage in CI.
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i 'testsrc2=size=128x128:rate=2' \
+            -frames:v 4 -pix_fmt yuv420p -threads 2 \
+            -c:v libx265 -preset ultrafast \
+            -x265-params 'pools=1:frame-threads=1:log-level=error' \
+            "$RUNNER_TEMP/hevc-synthetic.mp4"
+
+          "$BIN" -hide_banner -loglevel warning -y \
+            -threads 1 -i "$RUNNER_TEMP/hevc-synthetic.mp4" \
+            -vf 'scale=64:-2' -frames:v 1 -q:v 5 \
+            "$RUNNER_TEMP/frame.jpg"
+          test -s "$RUNNER_TEMP/frame.jpg"
+          test "$(file --brief --mime-type "$RUNNER_TEMP/frame.jpg")" = 'image/jpeg'
+          (cd "$RUNNER_TEMP/bundle" && sha256sum ffmpeg-hevc > SHA256SUMS)
+
+      - name: Upload standalone binary and licenses
+        uses: actions/upload-artifact@v4
+        with:
+          name: v380-hevc-aarch64-musl
+          path: |
+            ${{ runner.temp }}/bundle/ffmpeg-hevc
+            ${{ runner.temp }}/bundle/SHA256SUMS
+            ${{ runner.temp }}/bundle/COPYING.LGPLv2.1
+            ${{ runner.temp }}/bundle/LICENSE.md
+          if-no-files-found: error
+          retention-days: 14
