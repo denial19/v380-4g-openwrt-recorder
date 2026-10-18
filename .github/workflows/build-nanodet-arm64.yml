@@ -1,0 +1,91 @@
+name: Build V380 NanoDet object detector (ARM64 static)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-nanodet-arm64.yml'
+      - 'ai/nanodet_main.cpp'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git cmake ninja-build build-essential file binutils curl ca-certificates ffmpeg
+      - name: Build static NCNN and NanoDet
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          mkdir -p "$RUNNER_TEMP/bundle"
+          git clone https://github.com/Tencent/ncnn.git ncnn
+          git -C ncnn checkout fc062e62b276b175f068bb7cf821a6a4acfc87c7
+          git -C ncnn submodule update --init --recursive
+          cmake -S ncnn -B ncnn/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNCNN_VULKAN=OFF -DNCNN_OPENMP=OFF \
+            -DNCNN_SIMPLEOCV=ON -DNCNN_PIXEL=ON \
+            -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_TESTS=OFF \
+            -DNCNN_BUILD_BENCHMARK=OFF -DNCNN_BUILD_TOOLS=OFF
+          cmake --build ncnn/build --target ncnn --parallel 4
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ncnn/examples/nanodet.cpp')
+          s = p.read_text()
+          assert 'static void draw_objects(' in s
+          assert 'nanodet.opt.use_vulkan_compute = true;' in s
+          s = s[:s.index('static void draw_objects(')]
+          s = s.replace('nanodet.opt.use_vulkan_compute = true;',
+                        'nanodet.opt.use_vulkan_compute = false;\n    nanodet.opt.num_threads = 1;')
+          s = s.replace('const float prob_threshold = 0.4f;', 'const float prob_threshold = 0.35f;')
+          p = Path('nanodet_v380.cpp')
+          p.write_text(s + '\n' + Path('ai/nanodet_main.cpp').read_text())
+          PY
+          c++ -std=c++11 -O2 -static -DUSE_NCNN_SIMPLEOCV \
+            -I ncnn/src -I ncnn/build/src -I ncnn/build/src/layer \
+            -o "$RUNNER_TEMP/bundle/v380-nanodet" nanodet_v380.cpp \
+            ncnn/build/src/libncnn.a -pthread -ldl -lm
+          if readelf -l "$RUNNER_TEMP/bundle/v380-nanodet" | grep -q INTERP; then
+            echo 'ERROR: binary unexpectedly requires a dynamic loader' >&2
+            exit 1
+          fi
+          cp ncnn/LICENSE.txt "$RUNNER_TEMP/bundle/NCNN_LICENSE.txt"
+          curl -fLsS --retry 3 https://raw.githubusercontent.com/RangiLyu/nanodet/main/LICENSE -o "$RUNNER_TEMP/bundle/NANODET_LICENSE.txt"
+      - name: Download verified pretrained NanoDet COCO weights
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/bundle"
+          curl -fLsS --retry 3 https://raw.githubusercontent.com/nihui/ncnn-assets/master/models/nanodet_m.param -o nanodet_m.param
+          curl -fLsS --retry 3 https://raw.githubusercontent.com/nihui/ncnn-assets/master/models/nanodet_m.bin -o nanodet_m.bin
+          test "$(git hash-object nanodet_m.param)" = b0d55d38cb884a457c93a31b5264657fc102b29e
+          test "$(git hash-object nanodet_m.bin)" = 0b4581f12490177907c35334297523148c2f6adf
+      - name: Smoke test JSON inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffmpeg -hide_banner -loglevel error -y -f lavfi -i 'testsrc2=size=320x320:rate=1' -frames:v 1 "$RUNNER_TEMP/test.jpg"
+          "$RUNNER_TEMP/bundle/v380-nanodet" "$RUNNER_TEMP/test.jpg" "$RUNNER_TEMP/bundle" > "$RUNNER_TEMP/output.json"
+          python3 - "$RUNNER_TEMP/output.json" <<'PY'
+          import json, sys
+          j = json.load(open(sys.argv[1]))
+          assert j['width'] == 320 and j['height'] == 320
+          assert isinstance(j['objects'], list)
+          print('NanoDet inference and JSON output: OK, detections:', len(j['objects']))
+          PY
+          (cd "$RUNNER_TEMP/bundle" && sha256sum v380-nanodet nanodet_m.param nanodet_m.bin > SHA256SUMS)
+          file "$RUNNER_TEMP/bundle/v380-nanodet"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v380-nanodet-arm64-static
+          path: ${{ runner.temp }}/bundle/
+          if-no-files-found: error
+          retention-days: 14
