@@ -1,0 +1,86 @@
+name: Build V380 YOLO11n NCNN (ARM64 CPU)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-yolo11n-arm64.yml'
+      - 'ai/yolo11n_main.cpp'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git cmake ninja-build build-essential file binutils curl ca-certificates ffmpeg
+      - name: Static NCNN and YOLO11n executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = 'aarch64'
+          git clone https://github.com/Tencent/ncnn.git ncnn
+          git -C ncnn checkout fc062e62b276b175f068bb7cf821a6a4acfc87c7
+          git -C ncnn submodule update --init --recursive
+          cmake -S ncnn -B ncnn/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNCNN_VULKAN=OFF -DNCNN_OPENMP=OFF \
+            -DNCNN_SIMPLEOCV=ON -DNCNN_PIXEL=ON \
+            -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_TESTS=OFF \
+            -DNCNN_BUILD_BENCHMARK=OFF -DNCNN_BUILD_TOOLS=OFF
+          cmake --build ncnn/build --target ncnn --parallel 4
+          mkdir -p "$RUNNER_TEMP/bundle"
+          c++ -std=c++11 -O2 -static -DUSE_NCNN_SIMPLEOCV \
+            -I ncnn/src -I ncnn/build/src -I ncnn/build/src/layer \
+            -o "$RUNNER_TEMP/bundle/v380-yolo11n" ai/yolo11n_main.cpp \
+            ncnn/build/src/libncnn.a -pthread -ldl -lm
+          if readelf -l "$RUNNER_TEMP/bundle/v380-yolo11n" | grep -q INTERP; then
+            echo 'Unexpected dynamic binary' >&2; exit 1
+          fi
+          cp ncnn/LICENSE.txt "$RUNNER_TEMP/bundle/NCNN_LICENSE.txt"
+      - name: Download pinned YOLO11n model weights (AGPL-3.0)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/bundle"
+          BASE=https://raw.githubusercontent.com/taiji1985/yolo11-ncnn/b252a8268237fd4a8d4cbe29ad2393b5539fcd41/yolo11n_ncnn_model
+          curl -fLsS --retry 3 "$BASE/model.ncnn.param" -o model.ncnn.param
+          curl -fLsS --retry 3 "$BASE/model.ncnn.bin" -o model.ncnn.bin
+          test "$(git hash-object model.ncnn.param)" = 'c6d2dd2fc3f3f48718d1d99c3258cf6fffff674d'
+          test "$(git hash-object model.ncnn.bin)" = 'f47b8d6cef4651dbe5e3d5e7cf8272ae81a42772'
+          curl -fLsS --retry 3 https://raw.githubusercontent.com/ultralytics/ultralytics/main/LICENSE -o ULTRALYTICS_AGPL_LICENSE.txt
+          cat > MODEL_NOTICE.txt <<'EOF'
+          YOLO11n pretrained COCO weights by Ultralytics, AGPL-3.0; NCNN export credited to taiji1985.
+          Model source: https://github.com/taiji1985/yolo11-ncnn/tree/b252a8268237fd4a8d4cbe29ad2393b5539fcd41/yolo11n_ncnn_model
+          Ultralytics source: https://github.com/ultralytics/ultralytics
+          See ULTRALYTICS_AGPL_LICENSE.txt. Assess AGPL obligations before redistributing this bundle.
+          EOF
+      - name: End-to-end real image smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/bundle"
+          curl -fLsS --retry 3 https://raw.githubusercontent.com/ultralytics/assets/main/imags/bus.jpg -o "$RUNNER_TEMP/bus.jpg" || \
+            curl -fLsS --retry 3 https://raw.githubusercontent.com/taiji1985/yolo11-ncnn/b252a8268237fd4a8d4cbe29ad2393b5539fcd41/bus.jpg -o "$RUNNER_TEMP/bus.jpg"
+          "$B/v380-yolo11n" "$RUNNER_TEMP/bus.jpg" "$B" 0.25 > "$RUNNER_TEMP/output.json"
+          python3 - "$RUNNER_TEMP/output.json" <<'PY'
+          import json,sys
+          j=json.load(open(sys.argv[1]))
+          assert j['width'] >= 32 and j['height'] >= 32
+          assert any(x['label'] in ('person','bus') for x in j['objects']), j
+          print('YOLO11n actual person/bus detections OK:', [(x['label'],x['confidence']) for x in j['objects']])
+          PY
+          (cd "$B" && sha256sum v380-yolo11n model.ncnn.param model.ncnn.bin > SHA256SUMS)
+          file "$B/v380-yolo11n"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v380-yolo11n-aarch64
+          path: ${{ runner.temp }}/bundle/
+          if-no-files-found: error
+          retention-days: 14
