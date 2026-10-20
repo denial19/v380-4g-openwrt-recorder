@@ -111,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           B="$RUNNER_TEMP/bundle"
-          curl -fLsS --retry 3 https://raw.githubusercontent.com/ultralytics/assets/main/imags/bus.jpg -o "$RUNNER_TEMP/test.jpg"
+          curl -fLsS --retry 3 https://raw.githubusercontent.com/taiji1985/yolo11-ncnn/b252a8268237fd4a8d4cbe29ad2393b5539fcd41/bus.jpg -o "$RUNNER_TEMP/test.jpg"
           for size in 640 960; do
             "$B/v380-visdrone" "$RUNNER_TEMP/test.jpg" "$B/models/$size" 0.10 > "$RUNNER_TEMP/$size.json"
             python3 - "$RUNNER_TEMP/$size.json" "$size" <<'PY'
