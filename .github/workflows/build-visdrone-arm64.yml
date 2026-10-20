@@ -1,0 +1,133 @@
+name: Build V380 VisDrone YOLO11s (ARM64)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-visdrone-arm64.yml'
+      - 'ai/visdrone_main.cpp'
+
+permissions:
+  contents: read
+
+jobs:
+  export-ncnn:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install export tools (x86_64)
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/exportvenv"
+          "$RUNNER_TEMP/exportvenv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/exportvenv/bin/pip" install 'ultralytics>=8.3.200,<9' 'huggingface_hub>=0.30,<2'
+          echo "$RUNNER_TEMP/exportvenv/bin" >> "$GITHUB_PATH"
+      - name: Download verified VisDrone weights and export 640/960
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/visdrone-models"
+          python3 - <<'PY'
+          import hashlib, shutil
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          from ultralytics import YOLO
+          from ultralytics import __version__
+          print('Ultralytics version:', __version__)
+          expected='3134756bf29e761550991c0f1e5d91b262736e1c383082172691503227f645e7'
+          original=Path(hf_hub_download(repo_id='dronefreak/visdrone-yolo11s',filename='best.pt'))
+          digest=hashlib.sha256(original.read_bytes()).hexdigest()
+          assert digest==expected, 'Unexpected upstream weights SHA256: '+digest
+          tmp_weights=Path('/tmp/visdrone-train-best.pt')
+          shutil.copy2(original,tmp_weights)
+          model=YOLO(str(tmp_weights))
+          names={int(k):str(v) for k,v in model.names.items()}
+          expected_names={0:'pedestrian',1:'people',2:'bicycle',3:'car',4:'van',5:'truck',6:'tricycle',7:'awning-tricycle',8:'bus',9:'motor',10:'others'}
+          assert names==expected_names, f'VisDrone class order changed: {names}'
+          for sz in (640,960):
+              print('Exporting input size:',sz,flush=True)
+              exported=Path(model.export(format='ncnn',imgsz=sz,batch=1,device='cpu'))
+              assert (exported/'model.ncnn.param').is_file() and (exported/'model.ncnn.bin').is_file(), exported
+              dest=Path('/tmp/visdrone-export')/str(sz)
+              dest.mkdir(parents=True,exist_ok=True)
+              shutil.copy2(exported/'model.ncnn.param',dest/'model.ncnn.param')
+              shutil.copy2(exported/'model.ncnn.bin',dest/'model.ncnn.bin')
+              (dest/'model_size.txt').write_text(str(sz)+'\n')
+              print('Exported',dest,'weights', (dest/'model.ncnn.bin').stat().st_size)
+          PY
+          mv /tmp/visdrone-export "$RUNNER_TEMP/visdrone-models/models"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: visdrone-ncnn-exports
+          path: ${{ runner.temp }}/visdrone-models/models/
+          if-no-files-found: error
+          retention-days: 3
+
+  build-arm64:
+    needs: export-ncnn
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: visdrone-ncnn-exports
+          path: ${{ runner.temp }}/bundle/models
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git cmake ninja-build build-essential file binutils curl ca-certificates ffmpeg
+      - name: Compile fully static ARM64 NCNN executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = 'aarch64'
+          git clone https://github.com/Tencent/ncnn.git ncnn
+          git -C ncnn checkout fc062e62b276b175f068bb7cf821a6a4acfc87c7
+          git -C ncnn submodule update --init --recursive
+          cmake -S ncnn -B ncnn/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DNCNN_VULKAN=OFF -DNCNN_OPENMP=OFF \
+            -DNCNN_SIMPLEOCV=ON -DNCNN_PIXEL=ON -DNCNN_BUILD_EXAMPLES=OFF \
+            -DNCNN_BUILD_TESTS=OFF -DNCNN_BUILD_BENCHMARK=OFF -DNCNN_BUILD_TOOLS=OFF
+          cmake --build ncnn/build --target ncnn --parallel 4
+          B="$RUNNER_TEMP/bundle"
+          c++ -std=c++11 -O2 -static -DUSE_NCNN_SIMPLEOCV \
+            -I ncnn/src -I ncnn/build/src -I ncnn/build/src/layer \
+            -o "$B/v380-visdrone" ai/visdrone_main.cpp \
+            ncnn/build/src/libncnn.a -pthread -ldl -lm
+          test "$(readelf -l "$B/v380-visdrone" | grep -c INTERP || true)" = 0
+          cp ncnn/LICENSE.txt "$B/NCNN_LICENSE.txt"
+          curl -fLsS --retry 3 https://raw.githubusercontent.com/ultralytics/ultralytics/main/LICENSE -o "$B/ULTRALYTICS_AGPL_LICENSE.txt"
+          cat > "$B/MODEL_NOTICE.txt" <<'EOF'
+          Model: dronefreak/visdrone-yolo11s best.pt, fine-tuned on VisDrone-DET.
+          License: AGPL-3.0; source: https://huggingface.co/dronefreak/visdrone-yolo11s
+          SHA256 original best.pt: 3134756bf29e761550991c0f1e5d91b262736e1c383082172691503227f645e7
+          Exported 640 and 960 variants from exactly these weights using Ultralytics on GitHub Actions.
+          NCNN library BSD-3-Clause; see NCNN_LICENSE.txt. Respect model redistribution/license obligations.
+          EOF
+      - name: Smoke test both exports on a real image
+        shell: bash
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/bundle"
+          curl -fLsS --retry 3 https://raw.githubusercontent.com/ultralytics/assets/main/imags/bus.jpg -o "$RUNNER_TEMP/test.jpg"
+          for size in 640 960; do
+            "$B/v380-visdrone" "$RUNNER_TEMP/test.jpg" "$B/models/$size" 0.10 > "$RUNNER_TEMP/$size.json"
+            python3 - "$RUNNER_TEMP/$size.json" "$size" <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1]))
+          assert d['model']=='visdrone-yolo11s' and d['width']>=32 and d['height']>=32
+          assert isinstance(d['objects'],list)
+          assert all(x['label'] in ('car','van','bus','truck','person') and 0<=x['confidence']<=1 for x in d['objects'])
+          print('Model',sys.argv[2],'real image test OK, objects',len(d['objects']))
+          PY
+          done
+          (cd "$B" && sha256sum v380-visdrone models/640/model.ncnn.param models/640/model.ncnn.bin models/640/model_size.txt models/960/model.ncnn.param models/960/model.ncnn.bin models/960/model_size.txt > SHA256SUMS)
+          file "$B/v380-visdrone"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v380-visdrone-yolo11s-arm64
+          path: ${{ runner.temp }}/bundle/
+          if-no-files-found: error
+          retention-days: 14
